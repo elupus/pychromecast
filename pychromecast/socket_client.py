@@ -622,7 +622,7 @@ class SocketClient(threading.Thread, CastStatusListener):
                 raise
             except ChromecastConnectionClosed as exc:
                 self._force_recon = True
-                self.logger.debug(
+                self.logger.info(
                     "[%s(%s):%s] %s",
                     self.fn or "",
                     self.host,
