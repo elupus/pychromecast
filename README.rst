@@ -19,13 +19,6 @@ currently supports:
 ready-made solution using PyChromecast for controlling and automating
 your Chromecast or Cast-enabled device like Google Home.*
 
-Dependencies
-------------
-
-PyChromecast depends on the Python packages requests, protobuf and
-zeroconf. Make sure you have these dependencies installed using
-``pip install -r requirements.txt``
-
 How to use
 ----------
 
