@@ -21,6 +21,8 @@ adds a low frame rate VP8 video stream (needs libvpx) to show instead.
 from __future__ import annotations
 
 import argparse
+import array
+import itertools
 import json
 import logging
 import os
@@ -30,9 +32,10 @@ import statistics
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from typing import IO
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -111,7 +114,8 @@ def run_ffmpeg(args: list[str]) -> subprocess.Popen[bytes]:
     """Start ffmpeg writing to a pipe."""
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", *args, "-"]
     _LOGGER.debug("Running %s", cmd)
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    # ffmpeg reads keyboard commands from stdin, keep it off the terminal.
+    return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
 
 
 def ogg_packets(stream: IO[bytes]) -> Iterator[bytes]:
@@ -134,7 +138,7 @@ def ogg_packets(stream: IO[bytes]) -> Iterator[bytes]:
                 partial = b""
 
 
-def opus_frames(ffmpeg_input: list[str], bitrate: int) -> Iterator[bytes]:
+def opus_frames(ffmpeg_input: list[str], bitrate: int) -> Generator[bytes]:
     """Run ffmpeg and yield raw 20 ms Opus frames."""
     with run_ffmpeg(
         [
@@ -264,12 +268,15 @@ class StreamConfig:  # pylint: disable=too-few-public-methods
 
 
 def build_offer(
-    audio: StreamConfig, video: StreamConfig | None, args: argparse.Namespace
+    audio: StreamConfig,
+    video: StreamConfig | None,
+    args: argparse.Namespace,
+    target_delay: int,
 ) -> dict:
     """Build a mirroring OFFER, same fields as Open Screen."""
     streams = [
         {
-            **audio.offer_fields(args.target_delay, args.event_log),
+            **audio.offer_fields(target_delay, args.event_log),
             "type": "audio_source",
             "codecName": "opus",
             "channels": CHANNELS,
@@ -279,7 +286,7 @@ def build_offer(
     if video:
         streams.append(
             {
-                **video.offer_fields(args.target_delay, args.event_log),
+                **video.offer_fields(target_delay, args.event_log),
                 "type": "video_source",
                 "codecName": "vp8",
                 "channels": 1,
@@ -300,9 +307,20 @@ def build_offer(
 # --------------------------------------------------------------------------
 
 
+# Our wall clock is read once and then advanced by the monotonic clock, which
+# also paces the RTP timestamps, so the system adjusting its time mid-session
+# can't skew the Sender Reports against the RTP timeline.
+WALL_EPOCH = time.time() - time.monotonic()
+
+
+def wall_clock(monotonic: float | None = None) -> float:
+    """Wall clock time of a monotonic time, default now."""
+    return WALL_EPOCH + (time.monotonic() if monotonic is None else monotonic)
+
+
 def ntp_now() -> int:
     """Wall clock as a 64 bit NTP timestamp."""
-    now = time.time() + NTP_EPOCH_OFFSET
+    now = wall_clock() + NTP_EPOCH_OFFSET
     return int(now * (1 << 32)) & 0xFFFFFFFFFFFFFFFF
 
 
@@ -336,6 +354,8 @@ class RtpSender:  # pylint: disable=too-many-instance-attributes
         self.checkpoint = -1
         self.rtt: float | None = None
         self.clock_offsets: list[float] = []
+        # (our time in seconds, offset) to see the receiver clock's rate
+        self.clock_samples: list[tuple[float, float]] = []
         # Our wall clock when the receiver answered, its RTCP session started
         # shortly before.
         self.session_start: float | None = None
@@ -415,7 +435,7 @@ class RtpSender:  # pylint: disable=too-many-instance-attributes
         with self._lock:
             rtp_ts = self.rtp_timestamp_at(capture_time)
             self._history[frame_id] = (rtp_ts, key_frame, encrypted)
-            self.capture_times[rtp_ts] = time.time() - (time.monotonic() - capture_time)
+            self.capture_times[rtp_ts] = wall_clock(capture_time)
             self._history.pop(frame_id - FRAME_HISTORY, None)
             self._latest_frame_id = frame_id
         num_packets = self._num_packets(len(encrypted))
@@ -506,6 +526,7 @@ class RtpSender:  # pylint: disable=too-many-instance-attributes
                 one_way = (self.rtt or 0) / 2
                 offset = (receiver_ntp - arrival_ntp) / (1 << 32) + one_way
                 self.clock_offsets.append(offset)
+                self.clock_samples.append((arrival_ntp / (1 << 32), offset))
             pos += 4 + block_words * 4
 
     def _handle_cast_feedback(self, body: bytes) -> None:
@@ -556,13 +577,26 @@ def rtcp_receiver(
             sender.handle_rtcp(data, arrival)
 
 
-def negotiate(
-    cast: pychromecast.Chromecast, args: argparse.Namespace, app_id: str
-) -> list[RtpSender]:
-    """Launch the receiver app, exchange OFFER/ANSWER and set up the senders.
+class Device:  # pylint: disable=too-few-public-methods
+    """A cast device we stream to, with its own session and audio source."""
 
-    The first sender is audio, the second, if any, video.
-    """
+    def __init__(
+        self, cast: pychromecast.Chromecast, app_id: str, audio_input: list[str]
+    ) -> None:
+        self.cast = cast
+        self.app_id = app_id
+        self.audio_input = audio_input
+        self.name = cast.cast_info.friendly_name or cast.cast_info.host
+        # Audio first, then video if the receiver accepted it.
+        self.senders: list[RtpSender] = []
+        # Seconds this device's whole timeline runs behind the others.
+        self.delay = 0.0
+        self.target_delay = 400
+
+
+def negotiate(device: Device, args: argparse.Namespace) -> None:
+    """Launch the receiver app, exchange OFFER/ANSWER and set up the senders."""
+    cast, app_id = device.cast, device.app_id
     controller = CastStreamingController(app_id)
     cast.register_handler(controller)
 
@@ -589,7 +623,7 @@ def negotiate(
         if args.video_input
         else None
     )
-    offer = build_offer(audio, video, args)
+    offer = build_offer(audio, video, args, device.target_delay)
     _LOGGER.info("Sending %s", json.dumps(offer))
     # Sent directly: the app does not necessarily list the namespace.
     socket_client.send_message(
@@ -597,27 +631,30 @@ def negotiate(
     )
     if not controller.answer_event.wait(10) or controller.answer is None:
         raise RuntimeError("No ANSWER received")
-    answer_time = time.time()
+    answer_time = wall_clock()
     if controller.answer.get("result") != "ok":
         raise RuntimeError(f"Offer rejected: {controller.answer}")
 
-    senders = make_senders(
-        cast.cast_info.host, controller.answer["answer"], audio, video
+    device.senders = make_senders(
+        device.name, cast.cast_info.host, controller.answer["answer"], audio, video
     )
-    for sender in senders:
+    for sender in device.senders:
         sender.session_start = answer_time
-    return senders
 
 
 def make_senders(
-    host: str, answer: dict, audio: StreamConfig, video: StreamConfig | None
+    device_name: str,
+    host: str,
+    answer: dict,
+    audio: StreamConfig,
+    video: StreamConfig | None,
 ) -> list[RtpSender]:
     """Create a sender for each stream the receiver accepted, audio first."""
     send_indexes = answer.get("sendIndexes", [])
     if audio.index not in send_indexes:
         raise RuntimeError(f"Receiver did not accept the audio stream: {answer}")
     dest = (host, answer["udpPort"])
-    _LOGGER.info("Streaming to %s:%s", *dest)
+    _LOGGER.info("Streaming to %s at %s:%s", device_name, *dest)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("", 0))
@@ -629,11 +666,13 @@ def make_senders(
             _LOGGER.warning("Receiver did not accept the %s stream", name)
             continue
         receiver_ssrc = answer["ssrcs"][send_indexes.index(config.index)]
-        senders.append(RtpSender(name, sock, dest, config, receiver_ssrc))
+        senders.append(
+            RtpSender(f"{device_name} {name}", sock, dest, config, receiver_ssrc)
+        )
     return senders
 
 
-def log_clock_offset(path: str, offset: float, spread: float) -> None:
+def log_clock_offset(path: str, device: str, offset: float, spread: float) -> None:
     """Append this run's offset and print the wall clock error over all runs.
 
     The receiver's RTCP clock is its wall clock truncated to whole seconds at
@@ -642,21 +681,35 @@ def log_clock_offset(path: str, offset: float, spread: float) -> None:
     """
     with open(path, "a", encoding="utf-8") as file:
         file.write(
-            json.dumps({"time": time.time(), "offset": offset, "spread": spread}) + "\n"
+            json.dumps(
+                {
+                    "time": time.time(),
+                    "device": device,
+                    "offset": offset,
+                    "spread": spread,
+                }
+            )
+            + "\n"
         )
     with open(path, encoding="utf-8") as file:
-        offsets = [json.loads(line)["offset"] for line in file if line.strip()]
+        entries = [json.loads(line) for line in file if line.strip()]
+    # Entries without a device are from single device runs before it was logged.
+    offsets = [
+        entry["offset"] for entry in entries if entry.get("device", device) == device
+    ]
     low, high = max(offsets), min(offsets) + 1
     if low >= high:
         _LOGGER.warning(
-            "Runs disagree (%.3f >= %.3f s): the clock is not truncated wall "
+            "%s runs disagree (%.3f >= %.3f s): the clock is not truncated wall "
             "time, or the receiver's wall clock moved between runs",
+            device,
             low,
             high,
         )
         return
     _LOGGER.info(
-        "Receiver wall clock is %+.3f to %+.3f s from ours over %s runs",
+        "%s wall clock is %+.3f to %+.3f s from ours over %s runs",
+        device,
         low,
         high,
         len(offsets),
@@ -714,6 +767,10 @@ def stream_video(
                 next_report += RTCP_INTERVAL
             if stop.wait(min(capture_time, next_report) - time.monotonic()):
                 return
+        # Also before the first frame: the receiver drops frames until then.
+        if time.monotonic() >= next_report:
+            sender.send_sender_report()
+            next_report += RTCP_INTERVAL
         spread = min(args.pacing_ms / 1000, 0.5 / args.fps)
         sender.send_frame(frame_id, capture_time, frame, key_frame, spread)
         if frame_id % max(1, round(args.fps * 5)) == 0:
@@ -725,16 +782,50 @@ def stream_video(
             )
 
 
-def report_clock(args: argparse.Namespace, sender: RtpSender) -> None:
+def clock_rate_ppm(samples: list[tuple[float, float]]) -> float | None:
+    """Rate of the receiver's clock against ours, None if under 30 s of samples.
+
+    Network delay only ever makes the offset smaller, so the largest offset in
+    each 5 s window is the least delayed sample; those are fitted to a line.
+    """
+    if not samples or samples[-1][0] - samples[0][0] < 30:
+        return None
+    windows: dict[int, tuple[float, float]] = {}
+    for at, offset in samples:
+        key = int((at - samples[0][0]) // 5)
+        if key not in windows or offset > windows[key][1]:
+            windows[key] = (at, offset)
+    return linear_slope(list(windows.values())) * 1e6
+
+
+def linear_slope(points: list[tuple[float, float]]) -> float:
+    """Least squares slope of y over x."""
+    mean_x = statistics.fmean(x for x, _ in points)
+    mean_y = statistics.fmean(y for _, y in points)
+    return sum((x - mean_x) * (y - mean_y) for x, y in points) / sum(
+        (x - mean_x) ** 2 for x, _ in points
+    )
+
+
+def report_clock(args: argparse.Namespace, device: Device) -> None:
     """Log how the receiver's RTCP clock relates to ours."""
+    sender = device.senders[0]
     if not sender.clock_offsets:
         return
     offset = statistics.median(sender.clock_offsets)
-    receiver_now = time.time() + offset
+    receiver_now = wall_clock() + offset
     spread = max(sender.clock_offsets) - min(sender.clock_offsets)
+    rate = clock_rate_ppm(sender.clock_samples)
+    if rate is not None:
+        _LOGGER.info(
+            "%s clock runs %+.1f ppm against ours (system clock, not its audio output)",
+            device.name,
+            rate,
+        )
     _LOGGER.info(
-        "Receiver clock is %+.3f s from ours (%s samples, spread %.1f ms, "
+        "%s clock is %+.3f s from ours (%s samples, spread %.1f ms, "
         "rtt %s), receiver time now %s",
+        device.name,
         offset,
         len(sender.clock_offsets),
         spread * 1000,
@@ -743,7 +834,7 @@ def report_clock(args: argparse.Namespace, sender: RtpSender) -> None:
         + f".{int(receiver_now % 1 * 1000):03d}",
     )
     if args.clock_log:
-        log_clock_offset(args.clock_log, offset, spread)
+        log_clock_offset(args.clock_log, device.name, offset, spread)
 
 
 def report_events(sender: RtpSender) -> None:
@@ -788,68 +879,277 @@ def report_events(sender: RtpSender) -> None:
         )
 
 
-def run_session(args: argparse.Namespace, senders: list[RtpSender]) -> None:
-    """Stream until the audio input ends or duration elapses."""
-    audio = senders[0]
+SYNC_FREQUENCIES = (1000, 2500, 4000)
+SYNC_BURST = 0.04
+SYNC_BANDWIDTH = 300
+
+
+def sync_test_input(frequency: int) -> list[str]:
+    """A soft edged tone burst at the start of every second of media time."""
+    expr = (
+        f"if(lt(mod(t,1),{SYNC_BURST}),"
+        f"0.5*sin(2*PI*{frequency}*t)*(0.5-0.5*cos(2*PI*mod(t,1)/{SYNC_BURST})),0)"
+    )
+    return ["-f", "lavfi", "-i", f"aevalsrc=exprs='{expr}':s={SAMPLE_RATE}"]
+
+
+class MicRecorder:
+    """Record the microphone to a 48 kHz mono WAV file with ffmpeg.
+
+    ffmpeg writes the file itself: piping the audio through Python lost
+    buffers whenever the pipe was not read fast enough.
+    """
+
+    def __init__(self, mic: str, path: str) -> None:
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+        cmd += ["-f", "avfoundation", "-thread_queue_size", "4096", "-i", mic]
+        cmd += ["-ac", "1", "-ar", str(SAMPLE_RATE), path]
+        # Runs until stop(), so not a with block.
+        self._proc = subprocess.Popen(  # pylint: disable=consider-using-with
+            cmd, stdin=subprocess.PIPE
+        )
+
+    def stop(self) -> None:
+        """Stop recording, letting ffmpeg finish the file."""
+        try:
+            self._proc.communicate(b"q", timeout=10)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            self._proc.wait()
+
+
+def load_recording(path: str) -> array.array:
+    """Read any audio file ffmpeg understands as 48 kHz mono samples."""
+    with run_ffmpeg(
+        ["-i", path, "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le"]
+    ) as proc:
+        assert proc.stdout is not None
+        data = proc.stdout.read()
+    samples = array.array("h")
+    samples.frombytes(data[: len(data) // 2 * 2])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    return samples
+
+
+def band_envelope(samples: array.array, frequency: int) -> list[float]:
+    """Energy around one frequency in 1 ms steps.
+
+    The band pass has the same width at every frequency, so each one delays
+    its bursts by the same amount and the comparison stays fair.
+    """
+    data = array.array("h", samples)
+    if sys.byteorder == "big":
+        data.byteswap()
+    band = f"bandpass=f={frequency}:width_type=h:w={SYNC_BANDWIDTH}"
+    filtered = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+        + ["-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", "-"]
+        + ["-af", f"{band},{band}", "-f", "s16le", "-"],
+        input=data.tobytes(),
+        capture_output=True,
+        check=True,
+    ).stdout
+    out = array.array("h")
+    out.frombytes(filtered[: len(filtered) // 2 * 2])
+    if sys.byteorder == "big":
+        out.byteswap()
+    step = SAMPLE_RATE // 1000
+    return [
+        sum(x * x for x in out[i : i + step]) / step
+        for i in range(0, len(out) - step + 1, step)
+    ]
+
+
+def burst_onsets(envelope: list[float]) -> list[float]:
+    """Seconds into the recording where each burst starts.
+
+    A burst is the loudest point within 0.4 s either side, well above the
+    noise floor; it starts where it first rises to half its own peak.
+    """
+    if not envelope:
+        return []
+    floor = sorted(envelope)[len(envelope) // 2] or 1.0
+    onsets: list[float] = []
+    for i, level in enumerate(envelope):
+        if level < floor * 30:
+            continue
+        if level < max(envelope[max(0, i - 400) : i + 401]):
+            continue
+        half = level / 2
+        j = i
+        while j > 0 and envelope[j - 1] >= half:
+            j -= 1
+        before = envelope[j - 1] if j > 0 else 0.0
+        fraction = (
+            (half - before) / (envelope[j] - before) if envelope[j] > before else 0
+        )
+        onsets.append((j - 1 + fraction) / 1000)
+    return onsets
+
+
+def analyze_sync(samples: array.array, names: list[str]) -> None:
+    """Compare when each device's bursts reached the microphone."""
+    _LOGGER.info(
+        "Analyzing %.1f s of microphone audio for %s",
+        len(samples) / SAMPLE_RATE,
+        ", ".join(names),
+    )
+    if not names or len(samples) < SAMPLE_RATE:
+        _LOGGER.warning("Nothing to analyze")
+        return
+    onsets = []
+    for name, frequency in zip(names, SYNC_FREQUENCIES, strict=False):
+        found = burst_onsets(band_envelope(samples, frequency))
+        gaps = [b - a for a, b in itertools.pairwise(found)]
+        _LOGGER.info(
+            "%s: %s bursts at %s Hz, spacing %s",
+            name,
+            len(found),
+            frequency,
+            f"{min(gaps):.3f}-{max(gaps):.3f} s, median {statistics.median(gaps):.4f}"
+            if gaps
+            else "-",
+        )
+        onsets.append(found)
+    for name, found in zip(names[1:], onsets[1:], strict=False):
+        pairs = []
+        for onset in found:
+            distance, nearest = min(
+                ((abs(ref - onset), ref) for ref in onsets[0]), default=(1.0, 0.0)
+            )
+            # Half the burst period: any further and it's the neighbouring burst.
+            if distance < 0.5:
+                pairs.append((nearest, (onset - nearest) * 1000))
+        if len(pairs) < 2:
+            _LOGGER.warning("%s: too few bursts to compare", name)
+            continue
+        diffs = [d for _, d in pairs]
+        slope = linear_slope(pairs)
+        _LOGGER.info(
+            "%s vs %s: %+.1f ms (median, %s bursts, stdev %.1f ms, range %+.1f to "
+            "%+.1f), drift %+.2f ms/min (%+.0f ppm)",
+            name,
+            names[0],
+            statistics.median(diffs),
+            len(diffs),
+            statistics.pstdev(diffs),
+            min(diffs),
+            max(diffs),
+            slope * 60,
+            slope * 1000,
+        )
+
+
+def run_session(args: argparse.Namespace, devices: list[Device]) -> None:
+    """Stream to all devices on one timeline until audio ends or duration elapses."""
     stop = threading.Event()
     threads = [
         threading.Thread(
-            target=rtcp_receiver, args=(audio.sock, senders, stop), daemon=True
+            target=rtcp_receiver,
+            args=(device.senders[0].sock, device.senders, stop),
+            daemon=True,
         )
+        for device in devices
     ]
     if args.npe_probe:
+        host = devices[0].senders[0].dest[0]
         threads.append(
-            threading.Thread(target=npe_probe, args=(audio.dest[0], stop), daemon=True)
+            threading.Thread(target=npe_probe, args=(host, stop), daemon=True)
         )
+    recording = args.save_recording or os.path.join(
+        tempfile.gettempdir(), f"cast_sync_{os.getpid()}.wav"
+    )
+    recorder = MicRecorder(args.mic, recording) if args.record else None
 
     start = time.monotonic()
-    for sender in senders:
-        sender.origin = start
-    # The receiver drops frames until it has seen a Sender Report.
-    for sender in senders:
-        sender.send_sender_report()
-    next_report = start + RTCP_INTERVAL
-    for sender in senders[1:]:
-        threads.append(
-            threading.Thread(
-                target=stream_video, args=(args, sender, start, stop), daemon=True
-            )
+    for device in devices:
+        for sender in device.senders:
+            sender.origin = start + device.delay
+    threads += [
+        threading.Thread(
+            target=stream_video,
+            args=(args, sender, start + device.delay, stop),
+            daemon=True,
         )
+        for device in devices
+        for sender in device.senders[1:]
+    ]
     for thread in threads:
         thread.start()
 
-    frame_id = 0
     try:
-        for opus in opus_frames(args.ffmpeg_input, args.bitrate):
-            capture_time = start + frame_id * FRAME_MS / 1000
-            if args.duration and capture_time - start >= args.duration:
-                break
-            delay = capture_time - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
-            audio.send_frame(frame_id, capture_time, opus)
-            if time.monotonic() >= next_report:
-                audio.send_sender_report()
-                next_report += RTCP_INTERVAL
-            if frame_id % 250 == 0:
-                _LOGGER.info(
-                    "Sent audio frame %s, receiver checkpoint %s, %s retransmits",
-                    frame_id,
-                    audio.checkpoint,
-                    audio.retransmits,
-                )
-            frame_id += 1
+        stream_audio(args, devices, start)
     finally:
         stop.set()
         for thread in threads:
             thread.join()
-        audio.sock.close()
-    report_session(args, senders)
+        for device in devices:
+            device.senders[0].sock.close()
+    for device in devices:
+        report_device(args, device)
+    if recorder:
+        # Let the last bursts play out before stopping the recording.
+        delay = max(device.delay for device in devices)
+        target_delay = max(device.target_delay for device in devices)
+        time.sleep(delay + target_delay / 1000 + 0.5)
+        recorder.stop()
+        samples = load_recording(recording)
+        if args.save_recording:
+            _LOGGER.info("Saved the recording to %s", recording)
+        else:
+            os.remove(recording)
+        analyze_sync(samples, [device.name for device in devices])
 
 
-def report_session(args: argparse.Namespace, senders: list[RtpSender]) -> None:
-    """Log the outcome of each stream."""
-    for sender in senders:
+def stream_audio(args: argparse.Namespace, devices: list[Device], start: float) -> None:
+    """Send each device the same frames, on its own possibly delayed timeline.
+
+    Frame n has the same RTP timestamp everywhere; a device with a delay gets
+    it, and Sender Reports matching it, that much later.
+    """
+    sources = [opus_frames(device.audio_input, args.bitrate) for device in devices]
+    frame_ids = [0] * len(devices)
+    next_frame = [start + device.delay for device in devices]
+    # The receiver drops frames until it has seen a Sender Report.
+    next_report = list(next_frame)
+    active = set(range(len(devices)))
+    try:
+        while active:
+            index = min(active, key=next_frame.__getitem__)
+            sender = devices[index].senders[0]
+            delay = next_frame[index] - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            if time.monotonic() >= next_report[index]:
+                sender.send_sender_report()
+                next_report[index] += RTCP_INTERVAL
+            frame_id = frame_ids[index]
+            opus = next(sources[index], None)
+            if opus is None or (
+                args.duration and frame_id * FRAME_MS / 1000 >= args.duration
+            ):
+                active.discard(index)
+                continue
+            sender.send_frame(frame_id, next_frame[index], opus)
+            if frame_id % 250 == 0:
+                _LOGGER.info(
+                    "Sent %s frame %s, receiver checkpoint %s, %s retransmits",
+                    sender.name,
+                    frame_id,
+                    sender.checkpoint,
+                    sender.retransmits,
+                )
+            frame_ids[index] += 1
+            next_frame[index] += FRAME_MS / 1000
+    finally:
+        for source in sources:
+            source.close()
+
+
+def report_device(args: argparse.Namespace, device: Device) -> None:
+    """Log the outcome of each stream of a device."""
+    for sender in device.senders:
         _LOGGER.info(
             "Done %s: checkpoint %s, %s packets, %s retransmits",
             sender.name,
@@ -858,7 +1158,7 @@ def report_session(args: argparse.Namespace, senders: list[RtpSender]) -> None:
             sender.retransmits,
         )
         report_events(sender)
-    report_clock(args, senders[0])
+    report_clock(args, device)
 
 
 def set_ffmpeg_inputs(args: argparse.Namespace) -> None:
@@ -880,10 +1180,14 @@ def set_ffmpeg_inputs(args: argparse.Namespace) -> None:
         args.video_input = None
 
 
-def main() -> None:
-    """Launch the streaming app, negotiate and stream."""
-    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
-    parser.add_argument("--cast", help="Name of cast device", default="Living Room")
+def add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the command line arguments."""
+    parser.add_argument(
+        "--cast",
+        action="append",
+        required=True,
+        help="Name of cast device, repeat to stream to several in sync",
+    )
     parser.add_argument(
         "--known-host",
         help="Add known host (IP), can be used multiple times",
@@ -900,6 +1204,20 @@ def main() -> None:
     parser.add_argument(
         "--target-delay", type=int, default=400, help="Playout delay in ms"
     )
+    parser.add_argument(
+        "--extra-delay",
+        action="append",
+        default=[],
+        metavar="NAME=MS",
+        help="Send this device everything later, to line it up with slower ones",
+    )
+    parser.add_argument(
+        "--target-delay-for",
+        action="append",
+        default=[],
+        metavar="NAME=MS",
+        help="Target playout delay for one device instead of --target-delay",
+    )
     parser.add_argument("--payload-type", type=int, default=AUDIO_PAYLOAD_TYPE)
     video = parser.add_mutually_exclusive_group()
     video.add_argument("--image", help="Still image to show while playing")
@@ -915,6 +1233,27 @@ def main() -> None:
         type=float,
         default=50.0,
         help="Spread each video frame's packets over this long, 0 sends a burst",
+    )
+    parser.add_argument(
+        "--sync-test",
+        action="store_true",
+        help="Play a once a second tone burst, a different pitch on each device",
+    )
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        help="Record the microphone and measure when each device's bursts arrive",
+    )
+    parser.add_argument("--save-recording", help="WAV file to keep the recording in")
+    parser.add_argument(
+        "--analyze",
+        help="Only analyze a saved recording, --cast names the devices in order",
+    )
+    parser.add_argument(
+        "--mic",
+        default=":0",
+        help="avfoundation microphone, list with: "
+        'ffmpeg -f avfoundation -list_devices true -i ""',
     )
     parser.add_argument(
         "--npe-probe",
@@ -940,35 +1279,83 @@ def main() -> None:
     )
     add_log_arguments(parser)
     add_network_arguments(parser)
+
+
+def default_app_id(cast: pychromecast.Chromecast) -> str:
+    """The streaming app the device supports."""
+    capabilities = cast.cast_info.device_capabilities
+    has_video = capabilities is not None and CastCapability.VIDEO_OUT in capabilities
+    return APP_ID_AUDIO_VIDEO if has_video else APP_ID_AUDIO_ONLY
+
+
+def parse_per_device(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, option: str
+) -> dict[str, int]:
+    """Device name to milliseconds from a repeatable NAME=MS option."""
+    values = {}
+    for item in getattr(args, option.lstrip("-").replace("-", "_")):
+        name, _, value = item.rpartition("=")
+        if name not in args.cast or not value.isdigit():
+            parser.error(f"{option} {item}: expected one of the --cast names=MS")
+        values[name] = int(value)
+    return values
+
+
+def main() -> None:
+    """Launch the streaming apps, negotiate and stream."""
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    add_arguments(parser)
     args = parser.parse_args()
     configure_logging(args)
     set_ffmpeg_inputs(args)
+    if args.sync_test and len(args.cast) > len(SYNC_FREQUENCIES):
+        parser.error(f"--sync-test supports up to {len(SYNC_FREQUENCIES)} devices")
+    extra_delays = parse_per_device(parser, args, "--extra-delay")
+    target_delays = parse_per_device(parser, args, "--target-delay-for")
+    if args.analyze:
+        analyze_sync(load_recording(args.analyze), args.cast)
+        return
 
     chromecasts, browser = pychromecast.get_listed_chromecasts(
-        friendly_names=[args.cast],
+        # A copy: found names are removed from the list passed in.
+        friendly_names=list(args.cast),
         known_hosts=args.known_host,
         zeroconf_instance=create_zeroconf(args),
     )
-    if not chromecasts:
-        print(f'No chromecast with name "{args.cast}" discovered')
+    by_name = {cast.cast_info.friendly_name: cast for cast in chromecasts}
+    missing = [name for name in args.cast if name not in by_name]
+    if missing:
+        print(f"No chromecast discovered with name: {', '.join(missing)}")
+        browser.stop_discovery()
         sys.exit(1)
-    cast = chromecasts[0]
-    cast.wait()
 
-    app_id = args.app_id
-    if app_id is None:
-        capabilities = cast.cast_info.device_capabilities
-        has_video = (
-            capabilities is not None and CastCapability.VIDEO_OUT in capabilities
+    devices = []
+    _LOGGER.info("Streaming to %s", ", ".join(args.cast))
+    for index, name in enumerate(args.cast):
+        cast = by_name[name]
+        cast.wait()
+        audio_input = (
+            sync_test_input(SYNC_FREQUENCIES[index])
+            if args.sync_test
+            else args.ffmpeg_input
         )
-        app_id = APP_ID_AUDIO_VIDEO if has_video else APP_ID_AUDIO_ONLY
+        device = Device(cast, args.app_id or default_app_id(cast), audio_input)
+        device.delay = extra_delays.get(name, 0) / 1000
+        device.target_delay = target_delays.get(name, args.target_delay)
+        if device.delay:
+            _LOGGER.info("%s gets everything %s ms later", name, device.delay * 1000)
+        devices.append(device)
 
     try:
-        run_session(args, negotiate(cast, args, app_id))
+        for device in devices:
+            negotiate(device, args)
+        run_session(args, devices)
     finally:
-        if not args.keep_app and cast.status and cast.status.app_id == app_id:
-            cast.quit_app()
-            time.sleep(1)
+        for device in devices:
+            status = device.cast.status
+            if not args.keep_app and status and status.app_id == device.app_id:
+                device.cast.quit_app()
+        time.sleep(1)
         browser.stop_discovery()
 
 
