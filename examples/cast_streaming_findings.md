@@ -4,9 +4,28 @@ Notes from experiments with `cast_streaming_audio_example.py`, a Python
 sender for the Cast Streaming ("mirroring") protocol modelled on Open
 Screen's `cast/standalone_sender`.
 
-Tested on two devices on the same LAN: a **Nest Hub** and a **Chromecast
-on a TV** (sound through the TV's speakers over HDMI). Results for other
-models may differ.
+Tested on three devices on the same LAN: a **Nest Hub**, a **Chromecast
+on a TV** (sound through the TV's speakers over HDMI) and an **audio-only
+Cast receiver** (no screen; it was muted, so only its RTCP reports were
+used). They turned out to behave quite differently; other models may
+differ again.
+
+| | Nest Hub | Chromecast on a TV | Audio-only receiver |
+|---|---|---|---|
+| Receiver app | `0F5096E8` (audio/video) | `0F5096E8` | `85CDB22F` (audio-only) |
+| Event log | packet received, ack sent | declined in the ANSWER | all, including played out |
+| `targetDelay` | ignored | ignored | honoured |
+| Playout | starts on arrival | starts on arrival | on schedule, never late |
+
+**It is the device, not the app.** The audio-only receiver also runs the
+audio/video app `0F5096E8` ("Chrome Mirroring", `appType: WEB` there too)
+and behaves exactly the same with it: same ANSWER, playout at capture +
+`targetDelay`, never late. So the streaming receiver in each device's
+firmware decides, not the app ID. The ANSWER may tell them apart up
+front: the device that schedules answered with `castMode`,
+`rtpExtensions` and `receiverRtcpEventLog`, both play-on-arrival
+devices with a `display` block (only three devices, so a hint, not a
+rule).
 
 Unless noted, timing numbers come from the `--sync-test --record`
 measurements with the Core Audio recorder (see "Measuring" below), not
@@ -17,7 +36,15 @@ from the earlier ffmpeg recorder, which silently lost audio.
 - **Receiver app.** The audio-only streaming app `85CDB22F` is rejected
   with `NOT_FOUND` by the Nest Hub. Devices with a screen need the
   audio/video app `0F5096E8` ("Chrome Mirroring"), which accepts an
-  OFFER with only an audio stream; the screen then stays black.
+  OFFER with only an audio stream; the screen then stays black. The
+  audio-only receiver runs `85CDB22F`.
+- **ANSWER contents differ.** The audio-only receiver's ANSWER also
+  carries `castMode`, `rtpExtensions` and `receiverRtcpEventLog`; the
+  screen devices send a `display` block instead (1280x720 and
+  `scaling: receiver` on the Nest Hub, 3840x2160 and `scaling: sender`
+  on the TV), suggesting different receiver implementations or versions.
+- **`rtpProfile`** is always `cast`; Open Screen writes it but never reads
+  it.
 - **Namespace.** OFFER and ANSWER go over
   `urn:x-cast:com.google.cast.webrtc`, but this is Cast Streaming, not
   WebRTC: no ICE, DTLS or SRTP. Libraries such as aiortc don't apply.
@@ -45,13 +72,20 @@ from the earlier ffmpeg recorder, which silently lost audio.
 ## Receiver event log (`receiverRtcpEventLog`)
 
 - The Nest Hub sends "packet received" and "ack sent" events, never
-  "decoded" or "played out" ones: its player doesn't report playout.
-- The TV sends no event log at all.
-- The ANSWER's `receiverRtcpEventLog` listed only the audio stream, yet
-  video events arrived too.
-- Event times are milliseconds since the receiver's RTCP session started;
-  with the clock offset below they map onto the sender's clock to within
-  a few ms (capture to packet arrival: median ~5 ms on the LAN).
+  "decoded" or "played out" ones. In Open Screen those two are what the
+  receiver logs by itself; "played out" needs the player to call
+  `ReportPlayoutEvent()`, which the hub's player doesn't, and Open Screen
+  has no way to report "decoded" at all.
+- The Nest Hub's ANSWER listed only the audio stream in
+  `receiverRtcpEventLog`, yet video events arrived too.
+- The TV's ANSWER has no `receiverRtcpEventLog`: it declines, and sends
+  no log.
+- The audio-only receiver sends every event type, one per frame,
+  including "played out" with its lateness (0 of 500 frames late).
+- Event times are milliseconds on the receiver's own clock. The script
+  measures each event from the frame's first packet arriving, plus half
+  the round trip, which works whatever the receiver's clock is like.
+  Capture to packet arrival is ~3-5 ms on this LAN.
 
 ## Receiver clocks
 
@@ -62,6 +96,10 @@ from the earlier ffmpeg recorder, which silently lost audio.
   `offset <= e < offset + 1`; intersecting runs narrows it
   (`--clock-log`). The Nest Hub came out within -26 to +19 ms of the
   sender's wall clock.
+- The audio-only receiver doesn't seem to do this: two separate sessions
+  measured +0.387 and +0.393 s, which suggests a continuous clock that
+  is really ~390 ms ahead of the sender's (one more run would confirm).
+  The whole-second bound doesn't apply to it.
 - Both devices' clocks ran within a few ppm of the sender's.
 - The sender's wall clock can be slewed by the OS mid-run (both devices
   suddenly appeared ~140 ppm off). Sender Report times now follow the
@@ -72,16 +110,22 @@ from the earlier ffmpeg recorder, which silently lost audio.
 
 ## Playout timing
 
-- **`targetDelay` does not change when sound comes out.** The Nest Hub
+- **The audio-only receiver plays on schedule.** Its played-out events
+  came 394 ms after arrival with a 400 ms `targetDelay`, and 794 ms with
+  800 ms, i.e. at capture + `targetDelay` (from capture: 798.7 ms
+  median), never late, while packet arrival jittered by tens of ms. It
+  works the way Open Screen's design intends.
+- **On the Nest Hub and the TV, `targetDelay` does not change when sound
+  comes out.** The Nest Hub
   accepts it (its RTCP feedback reports the requested value), but
   100, 400, 800 and 2000 ms all gave the same playout timing, with no
   slow steering towards the target either. The TV also showed no change
   at 800 ms (measured with the older, lossy recorder).
 - **Timestamp gaps are ignored.** A 300 ms jump in RTP time mid-stream
   inserted no silence, with Opus and with AAC.
-- So the players start on arrival and then play at their own pace; the
-  OFFER's playout delay only matters inside the receiver (for example
-  how long it waits for retransmits).
+- So those two players start on arrival and then play at their own pace;
+  the OFFER's playout delay only matters inside the receiver (for
+  example how long it waits for retransmits).
 - **Sending later is the lever that works.** Delaying everything sent to
   one device (frames and matching Sender Reports, `--extra-delay`)
   shifted its playout by that amount on both devices.
@@ -95,6 +139,10 @@ from the earlier ffmpeg recorder, which silently lost audio.
 - Network delay is negligible here: ~5-6 ms round trip to each device.
 - Compensating with `--extra-delay` brings the devices within a few tens
   of ms, but see the open questions.
+- A group mixing both kinds of player would need both mechanisms: one
+  shared timeline and `targetDelay` for devices that play on schedule
+  (plus a fixed offset for their output latency), and send timing
+  (`--extra-delay`) for devices that play on arrival.
 
 ## Open questions
 

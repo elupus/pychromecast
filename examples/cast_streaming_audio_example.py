@@ -407,9 +407,6 @@ class RtpSender:  # pylint: disable=too-many-instance-attributes
         self.clock_offsets: list[float] = []
         # (our time in seconds, offset) to see the receiver clock's rate
         self.clock_samples: list[tuple[float, float]] = []
-        # Our wall clock when the receiver answered, its RTCP session started
-        # shortly before.
-        self.session_start: float | None = None
         # rtp timestamp -> our wall clock time of capture
         self.capture_times: dict[int, float] = {}
         # (rtp timestamp, event, ms since receiver session start, value)
@@ -683,15 +680,12 @@ def negotiate(device: Device, args: argparse.Namespace) -> None:
     )
     if not controller.answer_event.wait(10) or controller.answer is None:
         raise RuntimeError("No ANSWER received")
-    answer_time = wall_clock()
     if controller.answer.get("result") != "ok":
         raise RuntimeError(f"Offer rejected: {controller.answer}")
 
     device.senders = make_senders(
         device.name, cast.cast_info.host, controller.answer["answer"], audio, video
     )
-    for sender in device.senders:
-        sender.session_start = answer_time
 
 
 def make_senders(
@@ -745,10 +739,7 @@ def log_clock_offset(path: str, device: str, offset: float, spread: float) -> No
         )
     with open(path, encoding="utf-8") as file:
         entries = [json.loads(line) for line in file if line.strip()]
-    # Entries without a device are from single device runs before it was logged.
-    offsets = [
-        entry["offset"] for entry in entries if entry.get("device", device) == device
-    ]
+    offsets = [entry["offset"] for entry in entries if entry.get("device") == device]
     low, high = max(offsets), min(offsets) + 1
     if low >= high:
         _LOGGER.warning(
@@ -907,19 +898,20 @@ def report_events(sender: RtpSender) -> None:
             sum(1 for value in late if value > 0),
             len(late),
         )
-    if not sender.clock_offsets or sender.session_start is None:
-        return
-    # Event times count from the receiver's session start, which is also when
-    # its NTP clock was anchored to whole seconds of its wall clock.
-    offset = statistics.median(sender.clock_offsets)
-    anchor = round(sender.session_start + NTP_EPOCH_OFFSET + offset - 0.1)
+    # Event times are on the receiver's clock, whose relation to ours differs
+    # between devices. Measure each event from the frame's first packet
+    # arriving instead: that is half a round trip after we sent it, which we
+    # did at its capture time.
+    arrived: dict[int, int] = {}
+    for rtp_ts, event, event_ms, _ in sender.events:
+        if event == "packet received":
+            arrived[rtp_ts] = min(event_ms, arrived.get(rtp_ts, event_ms))
+    one_way = (sender.rtt or 0) / 2
     latencies: dict[str, list[float]] = {}
     for rtp_ts, event, event_ms, _ in sender.events:
-        if rtp_ts not in sender.capture_times:
-            continue
-        event_time = anchor + event_ms / 1000 - offset - NTP_EPOCH_OFFSET
-        latency = event_time - sender.capture_times[rtp_ts]
-        latencies.setdefault(event, []).append(latency * 1000)
+        if rtp_ts in arrived:
+            latency = one_way + (event_ms - arrived[rtp_ts]) / 1000
+            latencies.setdefault(event, []).append(latency * 1000)
     for event, values in latencies.items():
         _LOGGER.info(
             "%s capture to %s: median %.1f ms, min %.1f, max %.1f",
